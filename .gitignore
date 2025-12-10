@@ -1,0 +1,5 @@
+node_modules/
+segments/
+video.mp4
+.env
+*.log

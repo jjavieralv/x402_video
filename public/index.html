@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Pay-Per-View Video</title>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      color: #fff;
+      min-height: 100vh;
+      margin: 0;
+      padding: 2rem;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    h1 { margin-bottom: 1rem; font-size: 1.8rem; }
+    .container { max-width: 900px; width: 100%; }
+    video {
+      width: 100%;
+      border-radius: 12px;
+      background: #000;
+      aspect-ratio: 16/9;
+    }
+    #status {
+      margin-top: 1rem;
+      padding: 1rem;
+      background: rgba(255,255,255,0.1);
+      border-radius: 8px;
+      font-family: monospace;
+      font-size: 0.9rem;
+    }
+    #stats {
+      display: flex;
+      gap: 2rem;
+      margin-top: 1rem;
+      flex-wrap: wrap;
+    }
+    .stat {
+      background: rgba(255,255,255,0.05);
+      padding: 1rem 1.5rem;
+      border-radius: 8px;
+      text-align: center;
+    }
+    .stat-value {
+      font-size: 1.5rem;
+      font-weight: bold;
+      color: #4ade80;
+    }
+    .stat-label {
+      font-size: 0.8rem;
+      color: #9ca3af;
+      margin-top: 0.25rem;
+    }
+    .paywall-overlay {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,0.95);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+      padding: 1rem;
+    }
+    .paywall-modal {
+      background: #1e293b;
+      padding: 2rem;
+      border-radius: 16px;
+      text-align: center;
+      max-width: 400px;
+      width: 90%;
+    }
+    .paywall-modal h2 { margin: 0 0 0.5rem 0; }
+    .paywall-modal p { color: #9ca3af; margin: 0.5rem 0; }
+    .price { font-size: 2rem; color: #4ade80; margin: 1rem 0; }
+    button {
+      background: #3b82f6;
+      color: white;
+      border: none;
+      padding: 1rem 2rem;
+      border-radius: 8px;
+      font-size: 1rem;
+      cursor: pointer;
+      width: 100%;
+      margin-top: 0.5rem;
+    }
+    button:hover { background: #2563eb; }
+    button.secondary { background: #374151; }
+    button.secondary:hover { background: #4b5563; }
+    .hidden { display: none !important; }
+    .info { font-size: 0.85rem; color: #9ca3af; margin-top: 1rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Pay-Per-View Streaming</h1>
+    <video id="video" controls></video>
+    <div id="stats">
+      <div class="stat">
+        <div class="stat-value" id="segments-paid">0</div>
+        <div class="stat-label">Segments Paid</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value" id="total-paid">$0.000</div>
+        <div class="stat-label">Total Spent</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value" id="current-segment">-</div>
+        <div class="stat-label">Current Segment</div>
+      </div>
+    </div>
+    <div id="status">Initializing player...</div>
+  </div>
+
+  <!-- Payment Modal -->
+  <div id="paywall" class="paywall-overlay hidden">
+    <div class="paywall-modal">
+      <h2>Payment Required</h2>
+      <p id="segment-info">Segment #0</p>
+      <div class="price">$0.001 USDC</div>
+      <p>Base Sepolia Testnet</p>
+      <button id="pay-btn">Open Payment Page</button>
+      <button class="secondary" id="cancel-btn">Cancel</button>
+      <p class="info">A new window will open for payment.<br>Return here after completing payment.</p>
+    </div>
+  </div>
+
+  <script>
+    const video = document.getElementById('video');
+    const status = document.getElementById('status');
+    const paywall = document.getElementById('paywall');
+    const segmentInfo = document.getElementById('segment-info');
+    const payBtn = document.getElementById('pay-btn');
+    const cancelBtn = document.getElementById('cancel-btn');
+
+    let segmentsPaid = 0;
+    let totalPaid = 0;
+    let pendingSegment = null;
+    let pendingCallbacks = null;
+    let paidSegments = new Set();
+    let hls = null;
+    let paymentWindow = null;
+    let checkInterval = null;
+
+    function updateStats() {
+      document.getElementById('segments-paid').textContent = segmentsPaid;
+      document.getElementById('total-paid').textContent = `$${totalPaid.toFixed(3)}`;
+    }
+
+    function showPaywall(segmentId) {
+      segmentInfo.textContent = `Segment #${segmentId}`;
+      document.getElementById('current-segment').textContent = segmentId;
+      paywall.classList.remove('hidden');
+      video.pause();
+    }
+
+    function hidePaywall() {
+      paywall.classList.add('hidden');
+      if (checkInterval) {
+        clearInterval(checkInterval);
+        checkInterval = null;
+      }
+    }
+
+    async function checkPaymentStatus(segmentId) {
+      try {
+        const res = await fetch(`/api/check-paid/${segmentId}`);
+        const data = await res.json();
+        return data.isPaid;
+      } catch (e) {
+        return false;
+      }
+    }
+
+    async function completePayment(segmentId) {
+      paidSegments.add(segmentId);
+      segmentsPaid++;
+      totalPaid += 0.001;
+      updateStats();
+      hidePaywall();
+
+      status.textContent = `Segment ${segmentId} paid! Loading...`;
+
+      if (pendingSegment && pendingCallbacks) {
+        loadSegmentDirectly(pendingSegment, pendingCallbacks);
+        pendingSegment = null;
+        pendingCallbacks = null;
+      }
+    }
+
+    // Listen for payment success from popup
+    window.addEventListener('message', (event) => {
+      if (event.data && event.data.type === 'payment-success') {
+        const segmentId = event.data.segmentId;
+        console.log('Payment success message received for segment:', segmentId);
+        completePayment(segmentId);
+      }
+    });
+
+    // Open payment page
+    payBtn.addEventListener('click', () => {
+      if (!pendingSegment) return;
+
+      const match = pendingSegment.url.match(/segment\/(\d+)/);
+      const segmentId = match ? match[1] : '0';
+
+      // Open payment page in new window
+      paymentWindow = window.open(`/pay/${segmentId}`, 'x402_payment', 'width=550,height=700');
+
+      status.textContent = 'Complete payment in the popup window...';
+
+      // Poll for payment completion
+      checkInterval = setInterval(async () => {
+        const isPaid = await checkPaymentStatus(segmentId);
+        if (isPaid) {
+          clearInterval(checkInterval);
+          checkInterval = null;
+          if (paymentWindow && !paymentWindow.closed) {
+            paymentWindow.close();
+          }
+          completePayment(segmentId);
+        }
+      }, 1500);
+    });
+
+    cancelBtn.addEventListener('click', () => {
+      hidePaywall();
+      pendingSegment = null;
+      pendingCallbacks = null;
+      status.textContent = 'Playback cancelled. Click play to try again.';
+    });
+
+    function loadSegmentDirectly(context, callbacks) {
+      fetch(context.url)
+        .then(response => {
+          if (!response.ok) {
+            if (response.status === 402) {
+              // Still requires payment
+              const match = context.url.match(/segment\/(\d+)/);
+              const segmentId = match ? match[1] : '0';
+              pendingSegment = context;
+              pendingCallbacks = callbacks;
+              showPaywall(segmentId);
+              return null;
+            }
+            throw new Error(`HTTP ${response.status}`);
+          }
+          return response.arrayBuffer();
+        })
+        .then(data => {
+          if (data) {
+            callbacks.onSuccess({ data }, { url: context.url }, context);
+            const match = context.url.match(/segment\/(\d+)/);
+            const segmentId = match ? match[1] : '?';
+            status.textContent = `Playing segment ${segmentId}`;
+          }
+        })
+        .catch(error => {
+          console.error('Segment load error:', error);
+          callbacks.onError({ code: 0, text: error.message }, context, null);
+        });
+    }
+
+    // Custom HLS loader
+    class PaymentLoader extends Hls.DefaultConfig.loader {
+      constructor(config) {
+        super(config);
+      }
+
+      load(context, config, callbacks) {
+        const url = context.url;
+
+        if (url.includes('/video/segment/')) {
+          const match = url.match(/segment\/(\d+)/);
+          const segmentId = match ? match[1] : '0';
+
+          // If already paid, load directly
+          if (paidSegments.has(segmentId)) {
+            loadSegmentDirectly(context, callbacks);
+            return;
+          }
+
+          // Check if payment required
+          fetch(url)
+            .then(response => {
+              if (response.status === 402) {
+                pendingSegment = context;
+                pendingCallbacks = callbacks;
+                showPaywall(segmentId);
+                status.textContent = 'Payment required for next segment...';
+              } else if (response.ok) {
+                // Segment is accessible, read it
+                return response.arrayBuffer().then(data => {
+                  paidSegments.add(segmentId);
+                  callbacks.onSuccess({ data }, { url: context.url }, context);
+                  status.textContent = `Playing segment ${segmentId}`;
+                });
+              } else {
+                callbacks.onError({ code: response.status, text: response.statusText }, context, null);
+              }
+            })
+            .catch(error => {
+              callbacks.onError({ code: 0, text: error.message }, context, null);
+            });
+        } else {
+          super.load(context, config, callbacks);
+        }
+      }
+    }
+
+    // Initialize HLS
+    if (Hls.isSupported()) {
+      hls = new Hls({
+        loader: PaymentLoader,
+        maxBufferLength: 5,
+        maxMaxBufferLength: 10,
+      });
+
+      hls.loadSource('/video/playlist.m3u8');
+      hls.attachMedia(video);
+
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        status.textContent = 'Ready! Click play - each segment costs $0.001 USDC';
+      });
+
+      hls.on(Hls.Events.FRAG_LOADED, (event, data) => {
+        status.textContent = `Loaded segment ${data.frag.sn}`;
+      });
+
+      hls.on(Hls.Events.ERROR, (event, data) => {
+        console.error('HLS Error:', data);
+        if (data.fatal) {
+          status.textContent = `Error: ${data.details}`;
+        }
+      });
+
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = '/video/playlist.m3u8';
+      status.textContent = 'Native HLS - payment handling limited';
+    } else {
+      status.textContent = 'HLS not supported';
+    }
+  </script>
+</body>
+</html>
